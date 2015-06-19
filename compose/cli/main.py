@@ -161,7 +161,7 @@ class TopLevelCommand(Command):
 
         monochrome = options['--no-color']
         print("Attaching to", list_containers(containers))
-        LogPrinter(containers, attach_params={'logs': True}, monochrome=monochrome).run()
+        LogPrinter(containers, attach_params={'logs': True}, monochrome=monochrome, follow=True, project=project).run()
 
     def port(self, project, options):
         """
