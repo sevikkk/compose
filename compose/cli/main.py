@@ -10,7 +10,9 @@ import sys
 from docker.errors import APIError
 import dockerpty
 
-from .. import __version__, legacy
+from .. import __version__
+from .. import legacy
+from ..const import DEFAULT_TIMEOUT
 from ..project import NoSuchService, ConfigurationError
 from ..service import BuildError, NeedsBuildError
 from ..config import parse_environment
@@ -170,13 +172,14 @@ class TopLevelCommand(Command):
         Usage: port [options] SERVICE PRIVATE_PORT
 
         Options:
-            --protocol=proto  tcp or udp (defaults to tcp)
+            --protocol=proto  tcp or udp [default: tcp]
             --index=index     index of the container if there are multiple
-                              instances of a service (defaults to 1)
+                              instances of a service [default: 1]
         """
+        index = int(options.get('--index'))
         service = project.get_service(options['SERVICE'])
         try:
-            container = service.get_container(number=options.get('--index') or 1)
+            container = service.get_container(number=index)
         except ValueError as e:
             raise UserError(str(e))
         print(container.get_local_port(
@@ -336,6 +339,7 @@ class TopLevelCommand(Command):
             container_options['ports'] = []
 
         container = service.create_container(
+            quiet=True,
             one_off=True,
             insecure_registry=insecure_registry,
             **container_options
@@ -348,7 +352,6 @@ class TopLevelCommand(Command):
             dockerpty.start(project.client, container.id, interactive=not options['-T'])
             exit_code = container.wait()
             if options['--rm']:
-                log.info("Removing %s..." % container.name)
                 project.client.remove_container(container.id)
             sys.exit(exit_code)
 
@@ -394,9 +397,8 @@ class TopLevelCommand(Command):
           -t, --timeout TIMEOUT      Specify a shutdown timeout in seconds.
                                      (default: 10)
         """
-        timeout = options.get('--timeout')
-        params = {} if timeout is None else {'timeout': int(timeout)}
-        project.stop(service_names=options['SERVICE'], **params)
+        timeout = float(options.get('--timeout') or DEFAULT_TIMEOUT)
+        project.stop(service_names=options['SERVICE'], timeout=timeout)
 
     def restart(self, project, options):
         """
@@ -408,9 +410,8 @@ class TopLevelCommand(Command):
           -t, --timeout TIMEOUT      Specify a shutdown timeout in seconds.
                                      (default: 10)
         """
-        timeout = options.get('--timeout')
-        params = {} if timeout is None else {'timeout': int(timeout)}
-        project.restart(service_names=options['SERVICE'], **params)
+        timeout = float(options.get('--timeout') or DEFAULT_TIMEOUT)
+        project.restart(service_names=options['SERVICE'], timeout=timeout)
 
     def up(self, project, options):
         """
@@ -439,9 +440,9 @@ class TopLevelCommand(Command):
                                    image needs to be updated. (EXPERIMENTAL)
             --no-recreate          If containers already exist, don't recreate them.
             --no-build             Don't build an image, even if it's missing
-            -t, --timeout TIMEOUT  When attached, use this timeout in seconds
-                                   for the shutdown. (default: 10)
-
+            -t, --timeout TIMEOUT  Use this timeout in seconds for container shutdown
+                                   when attached or when containers are already
+                                   running. (default: 10)
         """
         insecure_registry = options['--allow-insecure-ssl']
         detached = options['-d']
@@ -452,6 +453,7 @@ class TopLevelCommand(Command):
         allow_recreate = not options['--no-recreate']
         smart_recreate = options['--x-smart-recreate']
         service_names = options['SERVICE']
+        timeout = float(options.get('--timeout') or DEFAULT_TIMEOUT)
 
         project.up(
             service_names=service_names,
@@ -460,6 +462,7 @@ class TopLevelCommand(Command):
             smart_recreate=smart_recreate,
             insecure_registry=insecure_registry,
             do_build=not options['--no-build'],
+            timeout=timeout
         )
 
         to_attach = [c for s in project.get_services(service_names) for c in s.containers()]
@@ -477,9 +480,7 @@ class TopLevelCommand(Command):
                 signal.signal(signal.SIGINT, handler)
 
                 print("Gracefully stopping... (press Ctrl+C again to force)")
-                timeout = options.get('--timeout')
-                params = {} if timeout is None else {'timeout': int(timeout)}
-                project.stop(service_names=service_names, **params)
+                project.stop(service_names=service_names, timeout=timeout)
 
     def migrate_to_labels(self, project, _options):
         """

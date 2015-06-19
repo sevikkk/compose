@@ -13,6 +13,7 @@ from docker.utils import create_host_config, LogConfig
 from . import __version__
 from .config import DOCKER_CONFIG_KEYS, merge_environment
 from .const import (
+    DEFAULT_TIMEOUT,
     LABEL_CONTAINER_NUMBER,
     LABEL_ONE_OFF,
     LABEL_PROJECT,
@@ -197,6 +198,7 @@ class Service(object):
                          do_build=True,
                          previous_container=None,
                          number=None,
+                         quiet=False,
                          **override_options):
         """
         Create a container for this service. If the image doesn't exist, attempt to pull
@@ -214,7 +216,7 @@ class Service(object):
             previous_container=previous_container,
         )
 
-        if 'name' in container_options:
+        if 'name' in container_options and not quiet:
             log.info("Creating %s..." % container_options['name'])
 
         return Container.create(self.client, **container_options)
@@ -249,26 +251,6 @@ class Service(object):
             return self.full_name
         else:
             return self.options['image']
-
-    def converge(self,
-                 allow_recreate=True,
-                 smart_recreate=False,
-                 insecure_registry=False,
-                 do_build=True):
-        """
-        If a container for this service doesn't exist, create and start one. If there are
-        any, stop them, create+start new ones, and remove the old containers.
-        """
-        plan = self.convergence_plan(
-            allow_recreate=allow_recreate,
-            smart_recreate=smart_recreate,
-        )
-
-        return self.execute_convergence_plan(
-            plan,
-            insecure_registry=insecure_registry,
-            do_build=do_build,
-        )
 
     def convergence_plan(self,
                          allow_recreate=True,
@@ -310,7 +292,8 @@ class Service(object):
     def execute_convergence_plan(self,
                                  plan,
                                  insecure_registry=False,
-                                 do_build=True):
+                                 do_build=True,
+                                 timeout=DEFAULT_TIMEOUT):
         (action, containers) = plan
 
         if action == 'create':
@@ -327,6 +310,7 @@ class Service(object):
                 self.recreate_container(
                     c,
                     insecure_registry=insecure_registry,
+                    timeout=timeout
                 )
                 for c in containers
             ]
@@ -348,7 +332,8 @@ class Service(object):
 
     def recreate_container(self,
                            container,
-                           insecure_registry=False):
+                           insecure_registry=False,
+                           timeout=DEFAULT_TIMEOUT):
         """Recreate a container.
 
         The original container is renamed to a temporary name so that data
@@ -357,7 +342,7 @@ class Service(object):
         """
         log.info("Recreating %s..." % container.name)
         try:
-            container.stop()
+            container.stop(timeout=timeout)
         except APIError as e:
             if (e.response.status_code == 500
                     and e.explanation
@@ -376,6 +361,7 @@ class Service(object):
             do_build=False,
             previous_container=container,
             number=container.labels.get(LABEL_CONTAINER_NUMBER),
+            quiet=True,
         )
         self.start_container(new_container)
         container.remove()
@@ -391,21 +377,6 @@ class Service(object):
     def start_container(self, container):
         container.start()
         return container
-
-    def start_or_create_containers(
-            self,
-            insecure_registry=False,
-            do_build=True):
-        containers = self.containers(stopped=True)
-
-        if not containers:
-            new_container = self.create_container(
-                insecure_registry=insecure_registry,
-                do_build=do_build,
-            )
-            return [self.start_container(new_container)]
-        else:
-            return [self.start_container_if_stopped(c) for c in containers]
 
     def config_hash(self):
         return json_hash(self.config_dict())
@@ -706,6 +677,47 @@ class Service(object):
         stream_output(output, sys.stdout)
 
 
+# Names
+
+
+def build_container_name(project, service, number, one_off=False):
+    bits = [project, service]
+    if one_off:
+        bits.append('run')
+    return '_'.join(bits + [str(number)])
+
+
+# Images
+
+
+def parse_repository_tag(s):
+    if ":" not in s:
+        return s, ""
+    repo, tag = s.rsplit(":", 1)
+    if "/" in tag:
+        return s, ""
+    return repo, tag
+
+
+# Volumes
+
+
+def merge_volume_bindings(volumes_option, previous_container):
+    """Return a list of volume bindings for a container. Container data volumes
+    are replaced by those from the previous container.
+    """
+    volume_bindings = dict(
+        build_volume_binding(parse_volume_spec(volume))
+        for volume in volumes_option or []
+        if ':' in volume)
+
+    if previous_container:
+        volume_bindings.update(
+            get_container_data_volumes(previous_container, volumes_option))
+
+    return volume_bindings.values()
+
+
 def get_container_data_volumes(container, volumes_option):
     """Find the container data volumes that are in `volumes_option`, and return
     a mapping of volume bindings for those volumes.
@@ -734,51 +746,8 @@ def get_container_data_volumes(container, volumes_option):
     return dict(volumes)
 
 
-def merge_volume_bindings(volumes_option, previous_container):
-    """Return a list of volume bindings for a container. Container data volumes
-    are replaced by those from the previous container.
-    """
-    volume_bindings = dict(
-        build_volume_binding(parse_volume_spec(volume))
-        for volume in volumes_option or []
-        if ':' in volume)
-
-    if previous_container:
-        volume_bindings.update(
-            get_container_data_volumes(previous_container, volumes_option))
-
-    return volume_bindings
-
-
-def build_container_name(project, service, number, one_off=False):
-    bits = [project, service]
-    if one_off:
-        bits.append('run')
-    return '_'.join(bits + [str(number)])
-
-
-def build_container_labels(label_options, service_labels, number, one_off=False):
-    labels = label_options or {}
-    labels.update(label.split('=', 1) for label in service_labels)
-    labels[LABEL_CONTAINER_NUMBER] = str(number)
-    labels[LABEL_VERSION] = __version__
-    return labels
-
-
-def parse_restart_spec(restart_config):
-    if not restart_config:
-        return None
-    parts = restart_config.split(':')
-    if len(parts) > 2:
-        raise ConfigError("Restart %s has incorrect format, should be "
-                          "mode[:max_retry]" % restart_config)
-    if len(parts) == 2:
-        name, max_retry_count = parts
-    else:
-        name, = parts
-        max_retry_count = 0
-
-    return {'Name': name, 'MaximumRetryCount': int(max_retry_count)}
+def build_volume_binding(volume_spec):
+    return volume_spec.internal, "{}:{}:{}".format(*volume_spec)
 
 
 def parse_volume_spec(volume_config):
@@ -801,18 +770,7 @@ def parse_volume_spec(volume_config):
     return VolumeSpec(external, internal, mode)
 
 
-def parse_repository_tag(s):
-    if ":" not in s:
-        return s, ""
-    repo, tag = s.rsplit(":", 1)
-    if "/" in tag:
-        return s, ""
-    return repo, tag
-
-
-def build_volume_binding(volume_spec):
-    internal = {'bind': volume_spec.internal, 'ro': volume_spec.mode == 'ro'}
-    return volume_spec.external, internal
+# Ports
 
 
 def build_port_bindings(ports):
@@ -841,6 +799,39 @@ def split_port(port):
 
     external_ip, external_port, internal_port = parts
     return internal_port, (external_ip, external_port or None)
+
+
+# Labels
+
+
+def build_container_labels(label_options, service_labels, number, one_off=False):
+    labels = label_options or {}
+    labels.update(label.split('=', 1) for label in service_labels)
+    labels[LABEL_CONTAINER_NUMBER] = str(number)
+    labels[LABEL_VERSION] = __version__
+    return labels
+
+
+# Restart policy
+
+
+def parse_restart_spec(restart_config):
+    if not restart_config:
+        return None
+    parts = restart_config.split(':')
+    if len(parts) > 2:
+        raise ConfigError("Restart %s has incorrect format, should be "
+                          "mode[:max_retry]" % restart_config)
+    if len(parts) == 2:
+        name, max_retry_count = parts
+    else:
+        name, = parts
+        max_retry_count = 0
+
+    return {'Name': name, 'MaximumRetryCount': int(max_retry_count)}
+
+
+# Extra hosts
 
 
 def build_extra_hosts(extra_hosts_config):

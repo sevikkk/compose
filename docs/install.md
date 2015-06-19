@@ -1,14 +1,21 @@
-page_title: Installing Compose
-page_description: How to install Docker Compose
-page_keywords: compose, orchestration, install, installation, docker, documentation
+<!--[metadata]>
++++
+title = "Docker Compose"
+description = "How to install Docker Compose"
+keywords = ["compose, orchestration, install, installation, docker, documentation"]
+[menu.main]
+parent="mn_install"
+weight=4
++++
+<![end-metadata]-->
 
 
-## Installing Compose
+# Install Docker Compose
 
 To install Compose, you'll need to install Docker first. You'll then install
 Compose with a `curl` command. 
 
-### Install Docker
+## Install Docker
 
 First, install Docker version 1.6 or greater:
 
@@ -16,7 +23,7 @@ First, install Docker version 1.6 or greater:
 - [Instructions for Ubuntu](http://docs.docker.com/installation/ubuntulinux/)
 - [Instructions for other systems](http://docs.docker.com/installation/)
 
-### Install Compose
+## Install Compose
 
 To install Compose, run the following commands:
 
@@ -36,9 +43,21 @@ Compose can also be installed as a Python package:
 No further steps are required; Compose should now be successfully installed.
 You can test the installation by running `docker-compose --version`.
 
+### Upgrading
+
+If you're coming from Compose 1.2 or earlier, you'll need to remove or migrate your existing containers after upgrading Compose. This is because, as of version 1.3, Compose uses Docker labels to keep track of containers, and so they need to be recreated with labels added.
+
+If Compose detects containers that were created without labels, it will refuse to run so that you don't end up with two sets of them. If you want to keep using your existing containers (for example, because they have data volumes you want to preserve) you can migrate them with the following command:
+
+    docker-compose migrate-to-labels
+
+Alternatively, if you're not worried about keeping them, you can remove them - Compose will just create new ones.
+
+    docker rm -f myapp_web_1 myapp_db_1 ...
+
 ## Compose documentation
 
-- [User guide](index.md)
+- [User guide](/)
 - [Get started with Django](django.md)
 - [Get started with Rails](rails.md)
 - [Get started with Wordpress](wordpress.md)
