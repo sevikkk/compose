@@ -24,7 +24,7 @@ from .const import (
 from .container import Container
 from .legacy import check_for_legacy_containers
 from .progress_stream import stream_output, StreamOutputError
-from .utils import json_hash
+from .utils import json_hash, parallel_execute
 
 log = logging.getLogger(__name__)
 
@@ -129,6 +129,7 @@ class Service(object):
         for c in self.containers(stopped=True):
             self.start_container_if_stopped(c, **options)
 
+    # TODO: remove these functions, project takes care of starting/stopping,
     def stop(self, **options):
         for c in self.containers():
             log.info("Stopping %s..." % c.name)
@@ -144,7 +145,9 @@ class Service(object):
             log.info("Restarting %s..." % c.name)
             c.restart(**options)
 
-    def scale(self, desired_num):
+    # end TODO
+
+    def scale(self, desired_num, timeout=DEFAULT_TIMEOUT):
         """
         Adjusts the number of containers to the specified number and ensures
         they are running.
@@ -154,47 +157,93 @@ class Service(object):
         - starts containers until there are at least `desired_num` running
         - removes all stopped containers
         """
-        if not self.can_be_scaled():
-            log.warn('Service %s specifies a port on the host. If multiple containers '
+        if self.custom_container_name() and desired_num > 1:
+            log.warn('The "%s" service is using the custom container name "%s". '
+                     'Docker requires each container to have a unique name. '
+                     'Remove the custom name to scale the service.'
+                     % (self.name, self.custom_container_name()))
+
+        if self.specifies_host_port():
+            log.warn('The "%s" service specifies a port on the host. If multiple containers '
                      'for this service are created on a single host, the port will clash.'
                      % self.name)
 
-        # Create enough containers
-        containers = self.containers(stopped=True)
-        while len(containers) < desired_num:
-            containers.append(self.create_container())
+        def create_and_start(service, number):
+            container = service.create_container(number=number, quiet=True)
+            container.start()
+            return container
 
-        running_containers = []
-        stopped_containers = []
-        for c in containers:
-            if c.is_running:
-                running_containers.append(c)
-            else:
-                stopped_containers.append(c)
-        running_containers.sort(key=lambda c: c.number)
-        stopped_containers.sort(key=lambda c: c.number)
+        running_containers = self.containers(stopped=False)
+        num_running = len(running_containers)
 
-        # Stop containers
-        while len(running_containers) > desired_num:
-            c = running_containers.pop()
-            log.info("Stopping %s..." % c.name)
-            c.stop(timeout=1)
-            stopped_containers.append(c)
+        if desired_num == num_running:
+            # do nothing as we already have the desired number
+            log.info('Desired container number already achieved')
+            return
 
-        # Start containers
-        while len(running_containers) < desired_num:
-            c = stopped_containers.pop(0)
-            log.info("Starting %s..." % c.name)
-            self.start_container(c)
-            running_containers.append(c)
+        if desired_num > num_running:
+            # we need to start/create until we have desired_num
+            all_containers = self.containers(stopped=True)
+
+            if num_running != len(all_containers):
+                # we have some stopped containers, let's start them up again
+                stopped_containers = sorted([c for c in all_containers if not c.is_running], key=attrgetter('number'))
+
+                num_stopped = len(stopped_containers)
+
+                if num_stopped + num_running > desired_num:
+                    num_to_start = desired_num - num_running
+                    containers_to_start = stopped_containers[:num_to_start]
+                else:
+                    containers_to_start = stopped_containers
+
+                parallel_execute(
+                    objects=containers_to_start,
+                    obj_callable=lambda c: c.start(),
+                    msg_index=lambda c: c.name,
+                    msg="Starting"
+                )
+
+                num_running += len(containers_to_start)
+
+            num_to_create = desired_num - num_running
+            next_number = self._next_container_number()
+            container_numbers = [
+                number for number in range(
+                    next_number, next_number + num_to_create
+                )
+            ]
+
+            parallel_execute(
+                objects=container_numbers,
+                obj_callable=lambda n: create_and_start(service=self, number=n),
+                msg_index=lambda n: n,
+                msg="Creating and starting"
+            )
+
+        if desired_num < num_running:
+            num_to_stop = num_running - desired_num
+            sorted_running_containers = sorted(running_containers, key=attrgetter('number'))
+            containers_to_stop = sorted_running_containers[-num_to_stop:]
+
+            parallel_execute(
+                objects=containers_to_stop,
+                obj_callable=lambda c: c.stop(timeout=timeout),
+                msg_index=lambda c: c.name,
+                msg="Stopping"
+            )
 
         self.remove_stopped()
 
     def remove_stopped(self, **options):
-        for c in self.containers(stopped=True):
-            if not c.is_running:
-                log.info("Removing %s..." % c.name)
-                c.remove(**options)
+        containers = [c for c in self.containers(stopped=True) if not c.is_running]
+
+        parallel_execute(
+            objects=containers,
+            obj_callable=lambda c: c.remove(**options),
+            msg_index=lambda c: c.name,
+            msg="Removing"
+        )
 
     def create_container(self,
                          one_off=False,
@@ -261,25 +310,28 @@ class Service(object):
 
     def convergence_plan(self,
                          allow_recreate=True,
-                         smart_recreate=False):
+                         force_recreate=False):
+
+        if force_recreate and not allow_recreate:
+            raise ValueError("force_recreate and allow_recreate are in conflict")
 
         containers = self.containers(stopped=True)
 
         if not containers:
             return ConvergencePlan('create', [])
 
-        if smart_recreate and not self._containers_have_diverged(containers):
-            stopped = [c for c in containers if not c.is_running]
-
-            if stopped:
-                return ConvergencePlan('start', stopped)
-
-            return ConvergencePlan('noop', containers)
-
         if not allow_recreate:
             return ConvergencePlan('start', containers)
 
-        return ConvergencePlan('recreate', containers)
+        if force_recreate or self._containers_have_diverged(containers):
+            return ConvergencePlan('recreate', containers)
+
+        stopped = [c for c in containers if not c.is_running]
+
+        if stopped:
+            return ConvergencePlan('start', stopped)
+
+        return ConvergencePlan('noop', containers)
 
     def _containers_have_diverged(self, containers):
         config_hash = None
@@ -525,7 +577,8 @@ class Service(object):
             for k in DOCKER_CONFIG_KEYS if k in self.options)
         container_options.update(override_options)
 
-        container_options['name'] = self.get_container_name(number, one_off)
+        container_options['name'] = self.custom_container_name() \
+            or self.get_container_name(number, one_off)
 
         if add_config_hash:
             config_hash = self.config_hash()
@@ -697,11 +750,14 @@ class Service(object):
             '{0}={1}'.format(LABEL_ONE_OFF, "True" if one_off else "False")
         ]
 
-    def can_be_scaled(self):
+    def custom_container_name(self):
+        return self.options.get('container_name')
+
+    def specifies_host_port(self):
         for port in self.options.get('ports', []):
             if ':' in str(port):
-                return False
-        return True
+                return True
+        return False
 
     def pull(self, insecure_registry=False):
         if 'image' not in self.options:
@@ -803,12 +859,7 @@ def parse_volume_spec(volume_config):
     if len(parts) == 2:
         parts.append('rw')
 
-    external, internal, mode = parts
-    if mode not in ('rw', 'ro'):
-        raise ConfigError("Volume %s has invalid mode (%s), should be "
-                          "one of: rw, ro." % (volume_config, mode))
-
-    return VolumeSpec(external, internal, mode)
+    return VolumeSpec(*parts)
 
 
 # Ports

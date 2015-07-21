@@ -16,6 +16,7 @@ from ..const import DEFAULT_TIMEOUT
 from ..project import NoSuchService, ConfigurationError
 from ..service import BuildError, NeedsBuildError
 from ..config import parse_environment
+from ..progress_stream import StreamOutputError
 from .command import Command
 from .docopt_command import NoSuchCommand
 from .errors import UserError
@@ -47,6 +48,9 @@ def main():
         sys.exit(1)
     except BuildError as e:
         log.error("Service '%s' failed to build: %s" % (e.service.name, e.reason))
+        sys.exit(1)
+    except StreamOutputError as e:
+        log.error(e)
         sys.exit(1)
     except NeedsBuildError as e:
         log.error("Service '%s' needs to be built, but --no-build was passed." % e.service.name)
@@ -372,8 +376,14 @@ class TopLevelCommand(Command):
 
             $ docker-compose scale web=2 worker=3
 
-        Usage: scale [SERVICE=NUM...]
+        Usage: scale [options] [SERVICE=NUM...]
+
+        Options:
+          -t, --timeout TIMEOUT      Specify a shutdown timeout in seconds.
+                                     (default: 10)
         """
+        timeout = int(options.get('--timeout') or DEFAULT_TIMEOUT)
+
         for s in options['SERVICE=NUM']:
             if '=' not in s:
                 raise UserError('Arguments to scale should be in the form service=num')
@@ -383,7 +393,7 @@ class TopLevelCommand(Command):
             except ValueError:
                 raise UserError('Number of containers for service "%s" is not a '
                                 'number' % service_name)
-            project.get_service(service_name).scale(num)
+            project.get_service(service_name).scale(num, timeout=timeout)
 
     def start(self, project, options):
         """
@@ -405,7 +415,7 @@ class TopLevelCommand(Command):
           -t, --timeout TIMEOUT      Specify a shutdown timeout in seconds.
                                      (default: 10)
         """
-        timeout = float(options.get('--timeout') or DEFAULT_TIMEOUT)
+        timeout = int(options.get('--timeout') or DEFAULT_TIMEOUT)
         project.stop(service_names=options['SERVICE'], timeout=timeout)
 
     def restart(self, project, options):
@@ -418,22 +428,27 @@ class TopLevelCommand(Command):
           -t, --timeout TIMEOUT      Specify a shutdown timeout in seconds.
                                      (default: 10)
         """
-        timeout = float(options.get('--timeout') or DEFAULT_TIMEOUT)
+        timeout = int(options.get('--timeout') or DEFAULT_TIMEOUT)
         project.restart(service_names=options['SERVICE'], timeout=timeout)
 
     def up(self, project, options):
         """
-        Build, (re)create, start and attach to containers for a service.
+        Builds, (re)creates, starts, and attaches to containers for a service.
 
-        By default, `docker-compose up` will aggregate the output of each container, and
-        when it exits, all containers will be stopped. If you run `docker-compose up -d`,
-        it'll start the containers in the background and leave them running.
+        Unless they are already running, this command also starts any linked services.
 
-        If there are existing containers for a service, `docker-compose up` will stop
-        and recreate them (preserving mounted volumes with volumes-from),
-        so that changes in `docker-compose.yml` are picked up. If you do not want existing
-        containers to be recreated, `docker-compose up --no-recreate` will re-use existing
-        containers.
+        The `docker-compose up` command aggregates the output of each container. When
+        the command exits, all containers are stopped. Running `docker-compose up -d`
+        starts the containers in the background and leaves them running.
+
+        If there are existing containers for a service, and the service's configuration
+        or image was changed after the container's creation, `docker-compose up` picks
+        up the changes by stopping and recreating the containers (preserving mounted
+        volumes). To prevent Compose from picking up changes, use the `--no-recreate`
+        flag.
+
+        If you want to force Compose to stop and recreate all containers, use the
+        `--force-recreate` flag.
 
         Usage: up [options] [SERVICE...]
 
@@ -444,9 +459,10 @@ class TopLevelCommand(Command):
                                    print new container names.
             --no-color             Produce monochrome output.
             --no-deps              Don't start linked services.
-            --x-smart-recreate     Only recreate containers whose configuration or
-                                   image needs to be updated. (EXPERIMENTAL)
+            --force-recreate       Recreate containers even if their configuration and
+                                   image haven't changed. Incompatible with --no-recreate.
             --no-recreate          If containers already exist, don't recreate them.
+                                   Incompatible with --force-recreate.
             --no-build             Don't build an image, even if it's missing
             -t, --timeout TIMEOUT  Use this timeout in seconds for container shutdown
                                    when attached or when containers are already
@@ -459,15 +475,18 @@ class TopLevelCommand(Command):
 
         start_deps = not options['--no-deps']
         allow_recreate = not options['--no-recreate']
-        smart_recreate = options['--x-smart-recreate']
+        force_recreate = options['--force-recreate']
         service_names = options['SERVICE']
-        timeout = float(options.get('--timeout') or DEFAULT_TIMEOUT)
+        timeout = int(options.get('--timeout') or DEFAULT_TIMEOUT)
+
+        if force_recreate and not allow_recreate:
+            raise UserError("--force-recreate and --no-recreate cannot be combined.")
 
         to_attach = project.up(
             service_names=service_names,
             start_deps=start_deps,
             allow_recreate=allow_recreate,
-            smart_recreate=smart_recreate,
+            force_recreate=force_recreate,
             insecure_registry=insecure_registry,
             do_build=not options['--no-build'],
             timeout=timeout
